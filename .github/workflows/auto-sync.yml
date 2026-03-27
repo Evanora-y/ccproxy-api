@@ -1,0 +1,22 @@
+name: Auto Sync Upstream
+
+on:
+  schedule:
+    # 每天 UTC 时间 00:00 自动执行（相当于美西时间下午 5 点 / 太平洋夏令时）
+    - cron: '0 0 * * *'
+  workflow_dispatch: # 保留手动触发按钮，方便随时在网页端点击运行测试
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Sync upstream changes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 使用 GitHub 官方 CLI 自动同步上游的 main 分支
+          # 如果你的主分支叫 master，请将下面的 main 替换为 master
+          gh repo sync ${{ github.repository }} -b main
