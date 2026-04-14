@@ -107,6 +107,153 @@ class TestClaudeAPIAdapter:
         # Headers should be filtered and enhanced
         assert result_headers["content-type"] == "application/json"
         assert result_headers["authorization"] == "Bearer test-token"
+        # Required OAuth beta tags must always be present
+        beta_tags = set(result_headers["anthropic-beta"].split(","))
+        assert "claude-code-20250219" in beta_tags
+        assert "oauth-2025-04-20" in beta_tags
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_merges_client_beta(
+        self, adapter: ClaudeAPIAdapter
+    ) -> None:
+        """Client-provided anthropic-beta tags must be preserved alongside required tags."""
+        body = json.dumps(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 100,
+            }
+        ).encode()
+        headers = {
+            "content-type": "application/json",
+            "anthropic-beta": "context-1m-2025-08-07,custom-tag",
+        }
+
+        _, result_headers = await adapter.prepare_provider_request(
+            body, headers, "/v1/messages"
+        )
+
+        beta_tags = set(result_headers["anthropic-beta"].split(","))
+        assert "claude-code-20250219" in beta_tags
+        assert "oauth-2025-04-20" in beta_tags
+        assert "context-1m-2025-08-07" in beta_tags
+        assert "custom-tag" in beta_tags
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_cli_beta_used_when_client_omits_header(
+        self,
+        mock_detection_service: ClaudeAPIDetectionService,
+        mock_auth_manager: Mock,
+        mock_http_pool_manager: Mock,
+    ) -> None:
+        """CLI-detected beta tags are used as a fallback when the client sends no anthropic-beta."""
+        mock_detection_service.get_detected_headers = Mock(  # type: ignore[method-assign]
+            return_value=DetectedHeaders(
+                {
+                    "anthropic-beta": "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14",
+                }
+            )
+        )
+        from ccproxy.plugins.claude_api.config import ClaudeAPISettings
+
+        adapter = ClaudeAPIAdapter(
+            detection_service=mock_detection_service,
+            config=ClaudeAPISettings(),
+            auth_manager=mock_auth_manager,
+            http_pool_manager=mock_http_pool_manager,
+        )
+
+        body = json.dumps(
+            {
+                "model": "claude-3-5-sonnet-20241022",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 100,
+            }
+        ).encode()
+        headers = {"content-type": "application/json"}
+
+        _, result_headers = await adapter.prepare_provider_request(
+            body, headers, "/v1/messages"
+        )
+
+        beta_tags = set(result_headers["anthropic-beta"].split(","))
+        assert "claude-code-20250219" in beta_tags
+        assert "oauth-2025-04-20" in beta_tags
+        assert "context-1m-2025-08-07" in beta_tags
+        assert "interleaved-thinking-2025-05-14" in beta_tags
+
+    @pytest.mark.asyncio
+    async def test_prepare_provider_request_cli_beta_skipped_when_client_sends_header(
+        self,
+        mock_detection_service: ClaudeAPIDetectionService,
+        mock_auth_manager: Mock,
+        mock_http_pool_manager: Mock,
+    ) -> None:
+        """When the client sends its own anthropic-beta the CLI-detected betas must not leak in.
+
+        Otherwise CLI defaults like ``context-1m-2025-08-07`` get injected into
+        every request and break model/account combos that don't support them
+        (e.g. haiku, or accounts without the long-context beta).
+        """
+        mock_detection_service.get_detected_headers = Mock(  # type: ignore[method-assign]
+            return_value=DetectedHeaders(
+                {
+                    "anthropic-beta": "claude-code-20250219,context-1m-2025-08-07,advisor-tool-2026-03-01",
+                }
+            )
+        )
+        from ccproxy.plugins.claude_api.config import ClaudeAPISettings
+
+        adapter = ClaudeAPIAdapter(
+            detection_service=mock_detection_service,
+            config=ClaudeAPISettings(),
+            auth_manager=mock_auth_manager,
+            http_pool_manager=mock_http_pool_manager,
+        )
+
+        body = json.dumps(
+            {
+                "model": "claude-haiku-4-5-20251001",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 100,
+            }
+        ).encode()
+        headers = {
+            "content-type": "application/json",
+            "anthropic-beta": "oauth-2025-04-20,prompt-caching-scope-2026-01-05",
+        }
+
+        _, result_headers = await adapter.prepare_provider_request(
+            body, headers, "/v1/messages"
+        )
+
+        beta_tags = set(result_headers["anthropic-beta"].split(","))
+        # Required OAuth tags + the client's own tags are present.
+        assert "claude-code-20250219" in beta_tags
+        assert "oauth-2025-04-20" in beta_tags
+        assert "prompt-caching-scope-2026-01-05" in beta_tags
+        # CLI-detected betas the client did not request must NOT leak in.
+        assert "context-1m-2025-08-07" not in beta_tags
+        assert "advisor-tool-2026-03-01" not in beta_tags
+
+    def test_merge_anthropic_beta_helper(self) -> None:
+        """_merge_anthropic_beta deduplicates and always includes required tags."""
+        result = ClaudeAPIAdapter._merge_anthropic_beta(None)
+        assert set(result.split(",")) == {
+            "claude-code-20250219",
+            "oauth-2025-04-20",
+        }
+
+        result = ClaudeAPIAdapter._merge_anthropic_beta(
+            "context-1m-2025-08-07, claude-code-20250219"
+        )
+        tags = result.split(",")
+        assert len(tags) == len(set(tags))
+        assert set(tags) == {
+            "claude-code-20250219",
+            "oauth-2025-04-20",
+            "context-1m-2025-08-07",
+        }
 
     @pytest.mark.asyncio
     async def test_prepare_provider_request_with_system_prompt(

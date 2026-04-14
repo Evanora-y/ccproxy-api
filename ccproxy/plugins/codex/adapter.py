@@ -301,12 +301,16 @@ class CodexAdapter(BaseHTTPAdapter):
         body_data["stream"] = True
         body_data["store"] = False
 
-        # Remove unsupported keys for Codex
+        # Remove unsupported keys for Codex. The chatgpt.com backend rejects
+        # "metadata" (which the anthropic.messages -> openai.responses converter
+        # populates from Anthropic's metadata.user_id) with
+        # {"detail":"Unsupported parameter: metadata"}.
         for key in (
             "max_output_tokens",
             "max_completion_tokens",
             "max_tokens",
             "temperature",
+            "metadata",
         ):
             body_data.pop(key, None)
 
@@ -647,22 +651,38 @@ class CodexAdapter(BaseHTTPAdapter):
             return data
 
         normalized_items: list[Any] = []
+        system_segments: list[str] = []
         for item in input_items:
-            if (
-                isinstance(item, dict)
-                and "type" not in item
-                and "role" in item
-                and "content" in item
-            ):
-                normalized_item = dict(item)
-                normalized_item["type"] = "message"
-                normalized_items.append(normalized_item)
-                continue
+            if isinstance(item, dict) and "role" in item and "content" in item:
+                role = item.get("role", "")
+                # Extract system/developer messages into instructions
+                # so they are not rejected by the upstream Responses API.
+                if role in ("system", "developer"):
+                    content = item.get("content")
+                    if isinstance(content, str) and content.strip():
+                        system_segments.append(content.strip())
+                    continue
+
+                if "type" not in item:
+                    normalized_item = dict(item)
+                    normalized_item["type"] = "message"
+                    normalized_items.append(normalized_item)
+                    continue
 
             normalized_items.append(item)
 
         result = dict(data)
         result["input"] = normalized_items
+
+        # Merge extracted system messages into the instructions field
+        if system_segments:
+            existing = result.get("instructions")
+            parts = []
+            if isinstance(existing, str) and existing.strip():
+                parts.append(existing.strip())
+            parts.extend(system_segments)
+            result["instructions"] = "\n\n".join(parts)
+
         return result
 
     def _request_body_is_encoded(self, headers: dict[str, str]) -> bool:
