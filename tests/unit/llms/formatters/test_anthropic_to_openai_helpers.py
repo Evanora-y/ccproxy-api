@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from ccproxy.llms.formatters.anthropic_to_openai import (
+    convert__anthropic_message_to_openai_chat__request,
     convert__anthropic_message_to_openai_chat__response,
     convert__anthropic_message_to_openai_responses__request,
     convert__anthropic_message_to_openai_responses__stream,
@@ -615,3 +616,210 @@ async def test_convert__anthropic_message_to_openai_responses__request_assistant
         {"cmd": "ls"},
         {"cmd": "pwd"},
     ]
+
+
+def test_billing_header_stripped_from_string_system() -> None:
+    """x-anthropic-billing-header lines must not appear in the converted instructions."""
+    req = anthropic_models.CreateMessageRequest(
+        model="claude-3",
+        system=(
+            "x-anthropic-billing-header: cc_version=2.1.117.48f; cc_entrypoint=cli; cch=71fea;\n"
+            "You are a helpful assistant."
+        ),
+        messages=[anthropic_models.Message(role="user", content="Hi")],
+        max_tokens=128,
+    )
+
+    out = convert__anthropic_message_to_openai_responses__request(req)
+    assert out.instructions == "You are a helpful assistant."
+
+
+def test_billing_header_stripped_from_block_system() -> None:
+    """Billing header lines in system *blocks* must not appear in instructions."""
+    req = anthropic_models.CreateMessageRequest(
+        model="claude-3",
+        system=[
+            anthropic_models.TextBlock(
+                type="text",
+                text=(
+                    "x-anthropic-billing-header: cc_version=2.1.117.48f; cch=deadbeef;\n"
+                    "You are a helpful assistant."
+                ),
+            ),
+            anthropic_models.TextBlock(
+                type="text",
+                text="Additional context.",
+            ),
+        ],
+        messages=[anthropic_models.Message(role="user", content="Hi")],
+        max_tokens=128,
+    )
+
+    out = convert__anthropic_message_to_openai_responses__request(req)
+    assert out.instructions is not None
+    assert "x-anthropic-billing-header" not in out.instructions
+    assert "You are a helpful assistant." in out.instructions
+    assert "Additional context." in out.instructions
+
+
+def test_billing_header_only_system_becomes_no_instructions() -> None:
+    """A system consisting solely of billing header lines yields no instructions."""
+    req = anthropic_models.CreateMessageRequest(
+        model="claude-3",
+        system="x-anthropic-billing-header: cc_version=2.1; cch=abc123;",
+        messages=[anthropic_models.Message(role="user", content="Hi")],
+        max_tokens=128,
+    )
+
+    out = convert__anthropic_message_to_openai_responses__request(req)
+    assert out.instructions is None
+
+
+def test_billing_header_stripped_case_insensitive() -> None:
+    """Stripping must be case-insensitive for the header name."""
+    req = anthropic_models.CreateMessageRequest(
+        model="claude-3",
+        system=(
+            "X-Anthropic-Billing-Header: cc_version=2.1; cch=abc123;\n"
+            "Real instructions."
+        ),
+        messages=[anthropic_models.Message(role="user", content="Hi")],
+        max_tokens=128,
+    )
+
+    out = convert__anthropic_message_to_openai_responses__request(req)
+    assert out.instructions == "Real instructions."
+
+
+def test_instructions_stable_across_requests_with_different_cch() -> None:
+    """Two requests differing only in cch= hash must produce identical instructions."""
+    base_system = "You are a helpful assistant."
+
+    def make_req(cch_hash: str) -> anthropic_models.CreateMessageRequest:
+        return anthropic_models.CreateMessageRequest(
+            model="claude-3",
+            system=(
+                f"x-anthropic-billing-header: cc_version=2.1.117; cch={cch_hash};\n"
+                + base_system
+            ),
+            messages=[anthropic_models.Message(role="user", content="Hi")],
+            max_tokens=128,
+        )
+
+    out1 = convert__anthropic_message_to_openai_responses__request(make_req("aaa111"))
+    out2 = convert__anthropic_message_to_openai_responses__request(make_req("bbb222"))
+
+    assert out1.instructions == out2.instructions == base_system
+
+
+def _chat_system_content(out: openai_models.ChatCompletionRequest) -> str | None:
+    for msg in out.messages:
+        role = getattr(msg, "role", None) or (
+            msg.get("role") if isinstance(msg, dict) else None
+        )
+        if role == "system":
+            content = getattr(msg, "content", None)
+            if content is None and isinstance(msg, dict):
+                content = msg.get("content")
+            return content if isinstance(content, str) else None
+    return None
+
+
+def test_chat_billing_header_stripped_from_string_system() -> None:
+    """x-anthropic-billing-header lines must not appear in chat system content."""
+    req = anthropic_models.CreateMessageRequest(
+        model="claude-3",
+        system=(
+            "x-anthropic-billing-header: cc_version=2.1.117.48f; cc_entrypoint=cli; cch=71fea;\n"
+            "You are a helpful assistant."
+        ),
+        messages=[anthropic_models.Message(role="user", content="Hi")],
+        max_tokens=128,
+    )
+
+    out = convert__anthropic_message_to_openai_chat__request(req)
+    assert _chat_system_content(out) == "You are a helpful assistant."
+
+
+def test_chat_billing_header_stripped_from_block_system() -> None:
+    """Billing header lines in chat system *blocks* must not appear in system content."""
+    req = anthropic_models.CreateMessageRequest(
+        model="claude-3",
+        system=[
+            anthropic_models.TextBlock(
+                type="text",
+                text=(
+                    "x-anthropic-billing-header: cc_version=2.1.117.48f; cch=deadbeef;\n"
+                    "You are a helpful assistant."
+                ),
+            ),
+            anthropic_models.TextBlock(
+                type="text",
+                text="Additional context.",
+            ),
+        ],
+        messages=[anthropic_models.Message(role="user", content="Hi")],
+        max_tokens=128,
+    )
+
+    out = convert__anthropic_message_to_openai_chat__request(req)
+    sys_content = _chat_system_content(out)
+    assert sys_content is not None
+    assert "x-anthropic-billing-header" not in sys_content
+    assert "You are a helpful assistant." in sys_content
+    assert "Additional context." in sys_content
+
+
+def test_chat_billing_header_only_system_drops_system_message() -> None:
+    """A system consisting solely of billing header lines yields no system message."""
+    req = anthropic_models.CreateMessageRequest(
+        model="claude-3",
+        system="x-anthropic-billing-header: cc_version=2.1; cch=abc123;",
+        messages=[anthropic_models.Message(role="user", content="Hi")],
+        max_tokens=128,
+    )
+
+    out = convert__anthropic_message_to_openai_chat__request(req)
+    roles = [
+        getattr(msg, "role", None)
+        or (msg.get("role") if isinstance(msg, dict) else None)
+        for msg in out.messages
+    ]
+    assert "system" not in roles
+
+
+def test_chat_billing_header_stripped_case_insensitive() -> None:
+    """Stripping must be case-insensitive for the chat system content."""
+    req = anthropic_models.CreateMessageRequest(
+        model="claude-3",
+        system=(
+            "X-Anthropic-Billing-Header: cc_version=2.1; cch=abc123;\n"
+            "Real instructions."
+        ),
+        messages=[anthropic_models.Message(role="user", content="Hi")],
+        max_tokens=128,
+    )
+
+    out = convert__anthropic_message_to_openai_chat__request(req)
+    assert _chat_system_content(out) == "Real instructions."
+
+
+def test_chat_system_stable_across_requests_with_different_cch() -> None:
+    """Two chat requests differing only in cch= hash must produce identical system content."""
+    base_system = "You are a helpful assistant."
+
+    def make_req(cch_hash: str) -> anthropic_models.CreateMessageRequest:
+        return anthropic_models.CreateMessageRequest(
+            model="claude-3",
+            system=(
+                f"x-anthropic-billing-header: cc_version=2.1.117; cch={cch_hash};\n"
+                + base_system
+            ),
+            messages=[anthropic_models.Message(role="user", content="Hi")],
+            max_tokens=128,
+        )
+
+    out1 = convert__anthropic_message_to_openai_chat__request(make_req("aaa111"))
+    out2 = convert__anthropic_message_to_openai_chat__request(make_req("bbb222"))
+
+    assert _chat_system_content(out1) == _chat_system_content(out2) == base_system
